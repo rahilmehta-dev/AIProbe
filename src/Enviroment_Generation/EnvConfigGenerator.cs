@@ -34,13 +34,15 @@ namespace AIprobe
 
             if (dependentConstraints.Count != 0)
             {
+                int envIndex = 0;
                 foreach (var sample in improvedLHS)
                 {
                     var newEnv = CloneEnvironment(baseEnv); // Clone the base environment
                     ApplySamplesToEnvironment(newEnv, sample, dataTypes);
 
-                    // Step 5: Adjust objects based on global attributes
-                    AdjustObjectsGlobally(newEnv);
+                    // Step 5: Adjust objects based on global attributes.
+                    // Per-environment Random so cloned objects are reproducible for a given seed.
+                    AdjustObjectsGlobally(newEnv, new Random(unchecked(seed * 1000003 + envIndex++)));
 
                     Aiprobe.LogAndDisplay($"Saved the generated sample env no: {sampledEnvironments.Count() + 1} in memory");
 
@@ -119,10 +121,13 @@ namespace AIprobe
                     string oneOfValues = VARIABLE.Constraint.Values ?? "";
                     string roundOff = string.IsNullOrEmpty(VARIABLE.Constraint.Choice) ? "0" : VARIABLE.Constraint.Choice;
 
+                    // Key by object identity so objects of the same type get their own dimension
+                    string objectKey = ObjectKey(attr, VARIABLE);
+
                     if (!minExpr.Contains("{") && !maxExpr.Contains("{"))
                     {
                         // Independent constraint
-                        independentRanges[attrName] = (double.Parse(minExpr), double.Parse(maxExpr), dataType,oneOfValues,int.Parse(roundOff));
+                        independentRanges[objectKey] = (double.Parse(minExpr), double.Parse(maxExpr), dataType,oneOfValues,int.Parse(roundOff));
                     }
                     else
                     {
@@ -130,7 +135,7 @@ namespace AIprobe
                         string strippedMinExpr = StripBraces(minExpr);
                         string strippedMaxExpr = StripBraces(maxExpr);
 
-                        dependentConstraints[attrName] = (MinExpr: strippedMinExpr, MaxExpr: strippedMaxExpr,
+                        dependentConstraints[objectKey] = (MinExpr: strippedMinExpr, MaxExpr: strippedMaxExpr,
                             DataType: dataType,oneOfValues,int.Parse(roundOff));
                     }
 
@@ -147,6 +152,12 @@ namespace AIprobe
         }
 
         
+
+        /// <summary>
+        /// Sample key of an object attribute, e.g. "Landmark#2.X". Keeps same-named attributes of
+        /// different objects in separate LHS dimensions.
+        /// </summary>
+        private static string ObjectKey(Object obj, Attribute attr) => $"{obj.Type}#{obj.Id}.{attr.Name.Value}";
 
         internal static Environment MutateObjectProperties(Environment environmentConfig,int seed)
         {
@@ -327,7 +338,7 @@ namespace AIprobe
         /// Adjusts objects and attributes dynamically based on global attributes.
         /// </summary>
         /// <param name="environment">The environment to adjust.</param>
-        private static void AdjustObjectsGlobally(Environment environment)
+        private static void AdjustObjectsGlobally(Environment environment, Random random)
         {
             // Retrieve all global attributes
             var globalAttributes = environment.Attributes;
@@ -387,7 +398,7 @@ namespace AIprobe
                     // Check if the object's type matches the global attribute name
                     if (obj.Type == globalAttribute.Name.Value)
                     {
-                        AdjustObjectCount(environment, globalAttribute);
+                        AdjustObjectCount(environment, globalAttribute, random);
                         break; // Break out of the inner loop once a match is found
                     }
                 }
@@ -440,7 +451,8 @@ namespace AIprobe
         /// </summary>
         /// <param name="environment">The environment to adjust.</param>
         /// <param name="globalAttribute">The global attribute controlling the object count.</param>
-        private static void AdjustObjectCount(Environment environment, Attribute globalAttribute)
+        /// <param name="random">Source of randomness for the values of newly created objects.</param>
+        private static void AdjustObjectCount(Environment environment, Attribute globalAttribute, Random random)
         {
             // Find objects of the same type as the global attribute's name
             var matchingObjects = environment.Objects.ObjectList.Where(o => o.Type == globalAttribute.Name.Value)
@@ -451,12 +463,17 @@ namespace AIprobe
             if (requiredCount > currentCount)
             {
                 // Add new objects to meet the required count
+                var clones = new List<Object>();
                 for (int i = 0; i < requiredCount - currentCount; i++)
                 {
                     var newObject = CloneObject(matchingObjects.First());
                     newObject.Id = ((environment.Objects.ObjectList.Count) + 1);
                     environment.Objects.ObjectList.Add(newObject);
+                    clones.Add(newObject);
                 }
+
+                // Clones start as copies of the template; give each its own values
+                SampleCloneAttributes(matchingObjects.First(), clones, random);
             }
             else if (requiredCount < currentCount)
             {
@@ -466,6 +483,167 @@ namespace AIprobe
                     environment.Objects.ObjectList.Remove(matchingObjects[i]);
                 }
             }
+        }
+
+
+        /// <summary>
+        /// Gives each clone of <paramref name="template"/> its own attribute values, sampled within the
+        /// clone's (already resolved) constraints. Per attribute the values are stratified across the range
+        /// (Latin Hypercube style, one value per stratum, independently permuted per attribute). Tuples that
+        /// collide with the template or an earlier clone are redrawn, and for all-int domains finally taken
+        /// from the unused cells, so positions are unique whenever the range can hold them.
+        /// Attributes whose constraints are not numeric after resolution keep the template's value.
+        /// </summary>
+        private static void SampleCloneAttributes(Object template, List<Object> clones, Random random)
+        {
+            int n = clones.Count;
+            if (n == 0)
+            {
+                return;
+            }
+
+            var dims = new List<(int Index, double Min, double Max, string DataType, string Values, int RoundOff)>();
+            for (int a = 0; a < template.Attributes.Count; a++)
+            {
+                var attr = template.Attributes[a];
+                if (!double.TryParse(attr.Constraint.Min ?? "0", out double min) ||
+                    !double.TryParse(attr.Constraint.Max ?? "0", out double max))
+                {
+                    Aiprobe.LogAndDisplay(
+                        $"Cloned {template.Type} objects keep the template value of '{attr.Name.Value}': constraint is not numeric");
+                    continue;
+                }
+
+                int.TryParse(attr.Constraint.Choice, out int roundOff);
+                dims.Add((a, min, max, attr.DataType.Value, attr.Constraint.Values ?? string.Empty, roundOff));
+            }
+
+            if (dims.Count == 0)
+            {
+                return;
+            }
+
+            // One stratified column of n values per attribute
+            var columns = new List<string[]>();
+            foreach (var dim in dims)
+            {
+                var intervals = new Dictionary<string, Queue<double>>();
+                var categorical = new Dictionary<string, Queue<object>>();
+                LhsSampler.SampleStratifiedData("v", dim.Min, dim.Max, dim.DataType, dim.Values, dim.RoundOff, n,
+                    random, intervals, categorical);
+
+                var column = new string[n];
+                for (int i = 0; i < n; i++)
+                {
+                    column[i] = categorical.ContainsKey("v")
+                        ? Convert.ToString(categorical["v"].Dequeue())
+                        : Convert.ToString(intervals["v"].Dequeue());
+                }
+
+                columns.Add(column);
+            }
+
+            // Finite domain only if every sampled attribute is an int range
+            double domainSize = 1;
+            bool finiteDomain = dims.All(d => d.DataType.Equals("int", StringComparison.OrdinalIgnoreCase) && d.Max >= d.Min);
+            if (finiteDomain)
+            {
+                foreach (var dim in dims)
+                {
+                    domainSize *= Math.Floor(dim.Max) - Math.Ceiling(dim.Min) + 1;
+                }
+            }
+
+            var taken = new HashSet<string>
+            {
+                string.Join("|", dims.Select(d => template.Attributes[d.Index].Value.Content))
+            };
+            List<string[]> freeCells = null; // built lazily, only when random redraws keep colliding
+            int duplicates = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                var values = columns.Select(c => c[i]).ToArray();
+
+                if (!taken.Add(string.Join("|", values)))
+                {
+                    values = null;
+
+                    // Redraw uniformly over the whole range
+                    for (int attempt = 0; attempt < 32 && values == null; attempt++)
+                    {
+                        var candidate = dims.Select(d => Convert.ToString(LhsSampler.SampleDependentData(d.Min, d.Max,
+                            d.DataType, d.Values, d.RoundOff, d.Max, random))).ToArray();
+                        if (taken.Add(string.Join("|", candidate)))
+                        {
+                            values = candidate;
+                        }
+                    }
+
+                    // Dense int domain: pick one of the cells that are still unused
+                    if (values == null && finiteDomain && domainSize <= 1_000_000)
+                    {
+                        freeCells ??= EnumerateFreeCells(dims, taken, random);
+                        while (values == null && freeCells.Count > 0)
+                        {
+                            var candidate = freeCells[freeCells.Count - 1];
+                            freeCells.RemoveAt(freeCells.Count - 1);
+                            if (taken.Add(string.Join("|", candidate)))
+                            {
+                                values = candidate;
+                            }
+                        }
+                    }
+
+                    if (values == null)
+                    {
+                        duplicates++;
+                        values = columns.Select(c => c[i]).ToArray();
+                    }
+                }
+
+                for (int j = 0; j < dims.Count; j++)
+                {
+                    clones[i].Attributes[dims[j].Index].Value.Content = values[j];
+                }
+            }
+
+            if (duplicates > 0)
+            {
+                Aiprobe.LogAndDisplay(
+                    $"{duplicates} cloned {template.Type} objects share a position: range too small for {n + 1} unique values");
+            }
+        }
+
+        /// <summary>
+        /// All int cells of the dims that are not in <paramref name="taken"/>, in random order.
+        /// </summary>
+        private static List<string[]> EnumerateFreeCells(
+            List<(int Index, double Min, double Max, string DataType, string Values, int RoundOff)> dims,
+            HashSet<string> taken, Random random)
+        {
+            var cells = new List<string[]>();
+            var lows = dims.Select(d => (long)Math.Ceiling(d.Min)).ToArray();
+            var sizes = dims.Select(d => (long)Math.Floor(d.Max) - (long)Math.Ceiling(d.Min) + 1).ToArray();
+            long total = sizes.Aggregate(1L, (acc, size) => acc * size);
+
+            for (long cell = 0; cell < total; cell++)
+            {
+                var values = new string[dims.Count];
+                long rest = cell;
+                for (int j = dims.Count - 1; j >= 0; j--)
+                {
+                    values[j] = Convert.ToString((double)(lows[j] + rest % sizes[j]));
+                    rest /= sizes[j];
+                }
+
+                if (!taken.Contains(string.Join("|", values)))
+                {
+                    cells.Add(values);
+                }
+            }
+
+            return cells.OrderBy(_ => random.Next()).ToList();
         }
 
 
@@ -484,7 +662,7 @@ namespace AIprobe
                 {
                     Name = attr.Name,
                     DataType = attr.DataType,
-                    Value = attr.Value,
+                    Value = new Value { Content = attr.Value.Content },
                     Mutable = attr.Mutable,
                     Constraint = new Constraint
                     {
@@ -630,7 +808,7 @@ namespace AIprobe
             {
                 foreach (var attr in obj.Attributes)
                 {
-                    string sampleKey = $"{attr.Name.Value}";
+                    string sampleKey = ObjectKey(obj, attr);
                     if (sample.ContainsKey(sampleKey))
                     {
                         attr.Value.Content = Convert.ToString(sample[sampleKey]);
@@ -687,7 +865,7 @@ namespace AIprobe
             {
                 foreach (var attr in obj.Attributes)
                 {
-                    string sampleKey = $"{attr.Name.Value}";
+                    string sampleKey = ObjectKey(obj, attr);
                     if (sample.ContainsKey(sampleKey))
                     {
                         attr.Value.Content = ConvertToString(sample[sampleKey]);

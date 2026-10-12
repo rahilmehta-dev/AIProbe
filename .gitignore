@@ -7,6 +7,8 @@ __pycache__/
 
 # C extensions
 *.so
+# ...but the self-contained .NET publish output needs its native Linux libraries
+!src/Enviroment_Generation/publish/**/*.so
 
 # Distribution / packaging
 .Python

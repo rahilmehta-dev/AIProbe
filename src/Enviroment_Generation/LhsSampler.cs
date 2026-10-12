@@ -236,7 +236,7 @@ public class LhsSampler
         return lhsSamples;
     }
 
-    private static void SampleStratifiedData(string key, double minValue, double maxValue, string dataType,
+    internal static void SampleStratifiedData(string key, double minValue, double maxValue, string dataType,
         string oneOfValues, int roundOff, int bins, Random random,
         Dictionary<string, Queue<double>> stratifiedIntervals, Dictionary<string, Queue<object>> stratifiedCategorical,
         Dictionary<string, object> currentSample = null)
@@ -312,7 +312,7 @@ public class LhsSampler
     }
 
 
-    private static object SampleDependentData(double minValue, double maxValue, string dataType, string oneOfValues,
+    internal static object SampleDependentData(double minValue, double maxValue, string dataType, string oneOfValues,
         int roundOff, double sample, Random random)
     {
         if (dataType.Equals("list", StringComparison.OrdinalIgnoreCase) ||
